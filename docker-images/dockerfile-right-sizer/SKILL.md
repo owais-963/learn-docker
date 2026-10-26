@@ -43,12 +43,13 @@ If Docker is available in the environment, you may also measure: `docker image l
 
 ### Phase 2: Apply the baseline (always)
 
-- Official or trusted **minimal base** (`-slim` or `-alpine` variant) with a **specific version tag** derived from evidence. Never `latest`.
+- Official or trusted **minimal base** with a **specific version tag** derived from evidence. Never `latest`. Default to `-slim`; use `-alpine` only when evidence shows no native modules or glibc-dependent binaries (see the Phase 3 table).
 - `.dockerignore` excluding at least: `.git`, dependency folders (`node_modules`, `.venv`, `target`, `vendor` when re-installed), `.env*`, keys/certs (`*.pem`, `*.key`), local build output, IDE folders, `Dockerfile*`.
 - Copy dependency manifests and lockfile **before** source code; install with the lockfile-respecting command (`npm ci`, `pnpm install --frozen-lockfile`, `yarn install --immutable` or `--frozen-lockfile`, `pip install -r` with pinned requirements, `uv sync --frozen`, `poetry install` without dev groups, `go mod download`).
 - **Production dependencies only** in the runtime image.
 - Combine related package-manager commands in one `RUN`, and clean caches in the same `RUN` (`apt-get update && apt-get install -y --no-install-recommends ... && rm -rf /var/lib/apt/lists/*`).
-- **Non-root `USER`** (use the image's built-in user, e.g. `node`, or create one with a fixed UID). Set file ownership with `COPY --chown`.
+- **Non-root `USER` as a numeric UID** (e.g. `USER 1000` for the Node image's built-in `node` user, or create a user with a fixed UID such as `10001` and set `USER 10001`). A numeric UID lets Kubernetes `runAsNonRoot` verify the container is non-root; a name like `USER node` makes the kubelet refuse to start the pod.
+- **Application code stays root-owned** (plain `COPY`, no `--chown`), so the runtime user can read but not modify it. Give the runtime user write access only to directories the app actually writes to (evidence: uploads, cache or temp paths in code/config), e.g. `RUN mkdir -p /app/data && chown 10001:10001 /app/data`.
 - **Exec-form** `CMD` / `ENTRYPOINT`, starting the runtime directly (e.g. `["node", "server.js"]`, not `npm start`).
 - **No secrets** in `ARG`, `ENV`, or copied files.
 - `EXPOSE` the evidenced port. `ENV` only for genuine runtime defaults (e.g. `NODE_ENV=production`, `PYTHONUNBUFFERED=1`).
@@ -91,16 +92,18 @@ Reference patterns (adapt to evidence, never copy blindly; replace `<version>` w
 **Node.js, no build step**
 ```dockerfile
 # syntax=docker/dockerfile:1
-FROM node:<version>-alpine
+FROM node:<version>-slim
 ENV NODE_ENV=production
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY --chown=node:node . .
-USER node
+COPY . .
+# Built-in "node" user; numeric so Kubernetes runAsNonRoot can verify it
+USER 1000
 EXPOSE <port>
 CMD ["node", "<entry-file>"]
 ```
+Switch to `-alpine` only if Phase 1 found no native modules.
 
 **Node.js with a build step (TypeScript/bundler)**: multi-stage is justified
 ```dockerfile
@@ -117,8 +120,8 @@ ENV NODE_ENV=production
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY --from=build --chown=node:node /app/<build-output-dir> ./<build-output-dir>
-USER node
+COPY --from=build /app/<build-output-dir> ./<build-output-dir>
+USER 1000
 EXPOSE <port>
 CMD ["node", "<build-output-dir>/<entry-file>"]
 ```
@@ -131,9 +134,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
 RUN useradd --create-home --uid 10001 appuser
-COPY --chown=appuser:appuser . .
-USER appuser
+USER 10001
 EXPOSE <port>
 CMD ["<server>", "<args binding 0.0.0.0:<port>>"]
 ```
@@ -160,25 +163,31 @@ If CGO is required (evidence: `import "C"`, CGO-dependent libraries), use a glib
 # syntax=docker/dockerfile:1
 FROM eclipse-temurin:<version>-jdk AS build
 WORKDIR /src
-COPY . .
+# Build files first so the dependency download is cached until they change
+COPY mvnw pom.xml ./
+COPY .mvn/ .mvn/
+RUN ./mvnw -B dependency:go-offline
+COPY src/ src/
 RUN <evidenced build command, e.g. ./mvnw -B package -DskipTests>
 
 FROM eclipse-temurin:<version>-jre
 RUN useradd --create-home --uid 10001 appuser
 WORKDIR /app
-COPY --from=build --chown=appuser:appuser /src/<path-to-jar> app.jar
-USER appuser
+COPY --from=build /src/<path-to-jar> app.jar
+USER 10001
 EXPOSE <port>
 CMD ["java", "-jar", "app.jar"]
 ```
+For Gradle, copy `gradlew`, `gradle/`, `settings.gradle*` and `build.gradle*` first, then run `./gradlew dependencies --no-daemon` before copying `src/`. For multi-module builds, copy every module's build file before the dependency step.
 
 ### Phase 6: Verify (when possible)
 
 If Docker is available:
 - `docker build -t <name>:check .` succeeds.
-- `docker run --rm <name>:check whoami` (or `id`) is not `root` (skip for distroless; confirm via image config `User`).
+- `docker run --rm <name>:check id` is not UID 0 (skip for distroless), and `docker image inspect -f '{{.Config.User}}' <name>:check` is a numeric UID.
 - The container starts and the port responds (health route if it exists).
 - `docker history --no-trunc <name>:check` contains no secrets.
+- Scan for known vulnerabilities: `trivy image --severity HIGH,CRITICAL <name>:check` (or `docker scout cves <name>:check` if Trivy isn't installed). Report what was found; fix by moving to a newer patched base tag or dependency version where one exists, and list the rest as known issues rather than hiding them.
 - Record image size and build time.
 - Run `hadolint` if available.
 
@@ -215,7 +224,7 @@ One or two sentences: what was produced and the overall shape (e.g. "single-stag
 - (list, or "None: the repo answered everything")
 
 ## Verification
-- What was run and the results, or the exact commands for the user to run.
+- What was run and the results (including the vulnerability scan summary), or the exact commands for the user to run.
 
 ## Issues found outside the Dockerfile
 - e.g. "`server.js` binds 127.0.0.1, so it will be unreachable in a container; change to 0.0.0.0."
